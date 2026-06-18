@@ -520,10 +520,49 @@
     return Math.sqrt(s/(a.length-1));
   }
 
-  // ===== Prohibition check =====
-  function profileViolatesProhibition(profile, prohibitions) {
-    for (const pr of prohibitions) {
-      if (profile[pr.attrA] === pr.levelA && profile[pr.attrB] === pr.levelB) return true;
+  // ===== Constraint engine (mirror of src/lib/constraints.ts — keep in sync) =====
+  var ANY_LEVEL = -1;
+  function termMatches(profile, t) {
+    if (t.level === ANY_LEVEL) return profile[t.attr] !== undefined;
+    return profile[t.attr] === t.level;
+  }
+  // Within-concept: prohibit/within (n-way), require, coOccur.
+  function violates(profile, constraints) {
+    for (const c of constraints) {
+      if (c.type === 'prohibit') {
+        if (c.scope === 'within') {
+          var all = c.terms.length > 0;
+          for (const t of c.terms) { if (!termMatches(profile, t)) { all = false; break; } }
+          if (all) return true;
+        }
+      } else if (c.type === 'require') {
+        if (termMatches(profile, c.ifTerm) && !c.allowed.includes(profile[c.thenAttr])) return true;
+      } else if (c.type === 'coOccur') {
+        if (termMatches(profile, c.a) !== termMatches(profile, c.b)) return true;
+      }
+    }
+    return false;
+  }
+  function conceptMatchesGroup(concept, group) {
+    for (const t of group) { if (!termMatches(concept, t)) return false; }
+    return true;
+  }
+  // Between-concept via system-of-distinct-representatives backtracking.
+  function taskViolates(concepts, constraints) {
+    for (const c of constraints) {
+      if (c.type !== 'prohibit' || c.scope !== 'between' || !c.groups.length) continue;
+      const used = new Array(concepts.length).fill(false);
+      const rec = (gi) => {
+        if (gi >= c.groups.length) return true;
+        for (let ci = 0; ci < concepts.length; ci++) {
+          if (used[ci] || !conceptMatchesGroup(concepts[ci], c.groups[gi])) continue;
+          used[ci] = true;
+          if (rec(gi + 1)) return true;
+          used[ci] = false;
+        }
+        return false;
+      };
+      if (rec(0)) return true;
     }
     return false;
   }
@@ -653,7 +692,7 @@
   }
 
   // ===== Balanced initialization =====
-  function balancedInit(attributes, prohibitions, J, S, rng) {
+  function balancedInit(attributes, constraints, J, S, rng) {
     const sizes = attributes.map(a => a.levels.length);
     const counts = attributes.map(a => new Array(a.levels.length).fill(0));
     const tasks = [];
@@ -676,14 +715,16 @@
         for (let a = 0; a < attributes.length; a++) prof.push(pickLevel(a, t*J + task.length));
         const sig = prof.join(',');
         if (sigSet.has(sig)) continue;
-        if (profileViolatesProhibition(prof, prohibitions)) continue;
+        if (violates(prof, constraints)) continue;
+        if (taskViolates(task.concat([prof]), constraints)) continue;
         sigSet.add(sig);
         task.push(prof);
         prof.forEach((li, a) => { counts[a][li]++; });
       }
       while (task.length < J) {
         const prof = sizes.map(L => Math.floor(rng()*L));
-        if (profileViolatesProhibition(prof, prohibitions)) continue;
+        if (violates(prof, constraints)) continue;
+        if (taskViolates(task.concat([prof]), constraints)) continue;
         task.push(prof);
         prof.forEach((li, a) => { counts[a][li]++; });
       }
@@ -696,7 +737,7 @@
   // Optimizes ONE version (T tasks) as its own small design. Swaps have strong
   // signal at this size, so D-efficiency / overlap / balance all move; the pooled
   // design inherits near-orthogonality from the individually-optimized versions.
-  function optimizeVersion(attributes, prohibitions, J, T, weights, swapBudget, rng) {
+  function optimizeVersion(attributes, constraints, J, T, weights, swapBudget, rng) {
     const A = attributes.length;
     const sizes = attributes.map(a => a.levels.length);
     const layout = buildLayout(attributes);
@@ -708,7 +749,7 @@
     const wB = (weights.balance != null ? weights.balance : 0.2);
     const wO = (weights.overlap != null ? weights.overlap : 0.5);
 
-    const tasks = balancedInit(attributes, prohibitions, J, T, rng); // fresh per version
+    const tasks = balancedInit(attributes, constraints, J, T, rng); // fresh per version
 
     // running state
     let M = new Float64Array(p*p);
@@ -744,10 +785,11 @@
       const nw = Math.floor(rng()*sizes[ai]);
       if (nw === old) continue;
       const newProf = tasks[ti][ji].slice(); newProf[ai] = nw;
-      if (profileViolatesProhibition(newProf, prohibitions)) continue;
+      if (violates(newProf, constraints)) continue;
       let dupProf = false;
       for (let q=0;q<J;q++){ if(q===ji)continue; if(tasks[ti][q].join(',')===newProf.join(',')){dupProf=true;break;} }
       if (dupProf) continue;
+      if (constraints.length) { const trialTask = tasks[ti].slice(); trialTask[ji] = newProf; if (taskViolates(trialTask, constraints)) continue; }
 
       // apply with incremental state update
       const oldC = taskContribution(tasks[ti], attributes, layout);
@@ -788,7 +830,7 @@
   }
   function runOptimize(payload) {
     const {
-      attributes, prohibitions, choiceConfig,
+      attributes, constraints, choiceConfig,
       versions, weights, budgetMs, swapBudget, baseSeed
     } = payload;
     const J = choiceConfig.altsPerTask;
@@ -813,10 +855,10 @@
       if (overBudget) {
         // Out of wall-clock budget: emit a balanced (un-annealed) version so the
         // design is still complete. Remaining versions take this fast path.
-        vt = balancedInit(attributes, prohibitions, J, T, rng);
+        vt = balancedInit(attributes, constraints, J, T, rng);
         verScores.push(0);
       } else {
-        const out = optimizeVersion(attributes, prohibitions, J, T, weights, perVerSwaps, rng);
+        const out = optimizeVersion(attributes, constraints, J, T, weights, perVerSwaps, rng);
         vt = out.tasks;
         verScores.push(out.score);
         if (out.score > bestVerScore) { bestVerScore = out.score; bestVer = v; }
@@ -1098,6 +1140,142 @@ function profileViolatesProhibition(profile, prohibitions) {
     if (profile[pr.attrA] === pr.levelA && profile[pr.attrB] === pr.levelB) return true;
   }
   return false;
+}
+
+// ===== Generalized constraint engine (mirror of src/lib/constraints.ts) =====
+var ANY_LEVEL = -1;
+var _cuid = 0;
+function _newCid(pre){ _cuid++; return (pre||'c')+'_'+Date.now().toString(36)+'_'+_cuid; }
+function migrateProhibitions(prohibitions) {
+  if (!prohibitions || !prohibitions.length) return [];
+  return prohibitions.map(p => ({
+    id: p.id || _newCid('c'), type: 'prohibit', scope: 'within',
+    terms: [{ attr: p.attrA, level: p.levelA }, { attr: p.attrB, level: p.levelB }], note: p.note,
+  }));
+}
+function getConstraints(study) {
+  if (study && study.constraints && study.constraints.length) return study.constraints;
+  return migrateProhibitions(study && study.prohibitions);
+}
+function termMatches(profile, t) {
+  if (t.level === ANY_LEVEL) return profile[t.attr] !== undefined;
+  return profile[t.attr] === t.level;
+}
+function profileViolatesConstraints(profile, constraints) {
+  for (const c of constraints) {
+    if (c.type === 'prohibit') {
+      if (c.scope === 'within') {
+        var all = c.terms.length > 0;
+        for (const t of c.terms) { if (!termMatches(profile, t)) { all = false; break; } }
+        if (all) return true;
+      }
+    } else if (c.type === 'require') {
+      if (termMatches(profile, c.ifTerm) && !c.allowed.includes(profile[c.thenAttr])) return true;
+    } else if (c.type === 'coOccur') {
+      if (termMatches(profile, c.a) !== termMatches(profile, c.b)) return true;
+    }
+  }
+  return false;
+}
+function _conceptMatchesGroup(concept, group){ for (const t of group){ if(!termMatches(concept,t)) return false; } return true; }
+function taskViolatesConstraints(concepts, constraints) {
+  for (const c of constraints) {
+    if (c.type !== 'prohibit' || c.scope !== 'between' || !c.groups.length) continue;
+    const used = new Array(concepts.length).fill(false);
+    const rec = (gi) => {
+      if (gi >= c.groups.length) return true;
+      for (let ci = 0; ci < concepts.length; ci++) {
+        if (used[ci] || !_conceptMatchesGroup(concepts[ci], c.groups[gi])) continue;
+        used[ci] = true; if (rec(gi + 1)) return true; used[ci] = false;
+      }
+      return false;
+    };
+    if (rec(0)) return true;
+  }
+  return false;
+}
+function enumerateFeasibleProfilesC(attributes, constraints, cap = 4000) {
+  const sizes = attributes.map(a => a.levels.length);
+  const total = sizes.reduce((s, x) => s * x, 1);
+  const out = [];
+  if (total <= cap) {
+    const stack = attributes.map(() => 0);
+    while (true) {
+      if (!profileViolatesConstraints(stack, constraints)) out.push(stack.slice());
+      let i = stack.length - 1;
+      while (i >= 0) { stack[i]++; if (stack[i] < sizes[i]) break; stack[i] = 0; i--; }
+      if (i < 0) break;
+    }
+  } else {
+    let t = 17; const rng = () => { t = (t + 0x6d2b79f5) | 0; let r = Math.imul(t ^ (t >>> 15), 1 | t); r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r; return ((r ^ (r >>> 14)) >>> 0) / 4294967296; };
+    const seen = new Set(); let safety = 0;
+    while (out.length < cap && safety++ < cap * 20) {
+      const p = sizes.map(L => Math.floor(rng() * L)); const key = p.join(',');
+      if (seen.has(key) || profileViolatesConstraints(p, constraints)) continue;
+      seen.add(key); out.push(p);
+    }
+  }
+  return out;
+}
+// Live feasibility report for the pre-flight panel.
+function feasibilityReport(attributes, constraints) {
+  const total = fullFactorialSize(attributes);
+  if (total === 0) return { total: 0, feasible: 0, fraction: 0, exact: true, empty: true };
+  const CAP = 20000;
+  if (total <= CAP) {
+    const f = enumerateFeasibleProfilesC(attributes, constraints, CAP).length;
+    return { total, feasible: f, fraction: f / total, exact: true, empty: f === 0 };
+  }
+  let s = 7; const rng = () => { s = (s + 0x6d2b79f5) | 0; let r = Math.imul(s ^ (s >>> 15), 1 | s); r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r; return ((r ^ (r >>> 14)) >>> 0) / 4294967296; };
+  const sizes = attributes.map(a => a.levels.length); const N = 4000; let ok = 0;
+  for (let i = 0; i < N; i++) { const p = sizes.map(L => Math.floor(rng() * L)); if (!profileViolatesConstraints(p, constraints)) ok++; }
+  const frac = ok / N;
+  return { total, feasible: Math.round(frac * total), fraction: frac, exact: false, empty: ok === 0 };
+}
+// Aliasing: attribute pairs whose level co-occurrence graph is disconnected ⇒ confounded.
+function detectAliasing(attributes, constraints) {
+  const A = attributes.length; if (A < 2) return [];
+  const feasible = enumerateFeasibleProfilesC(attributes, constraints, 8000);
+  if (!feasible.length) return [];
+  const out = [];
+  const components = (adj, nodes) => {
+    const seen = new Set(); let comps = 0;
+    for (const start of nodes) {
+      if (seen.has(start)) continue; comps++; const st = [start]; seen.add(start);
+      while (st.length) { const u = st.pop(); const nb = adj.get(u); if (!nb) continue; for (const v of nb) if (!seen.has(v)) { seen.add(v); st.push(v); } }
+    }
+    return comps;
+  };
+  for (let a = 0; a < A; a++) for (let b = a + 1; b < A; b++) {
+    const La = attributes[a].levels.length, Lb = attributes[b].levels.length;
+    if (La < 2 || Lb < 2) continue;
+    const adj = new Map(); const nodes = [];
+    for (let i = 0; i < La; i++) { adj.set(i, new Set()); nodes.push(i); }
+    for (let j = 0; j < Lb; j++) { adj.set(La + j, new Set()); nodes.push(La + j); }
+    const aSeen = new Set(), bSeen = new Set();
+    for (const p of feasible) { const u = p[a], v = La + p[b]; adj.get(u).add(v); adj.get(v).add(u); aSeen.add(p[a]); bSeen.add(p[b]); }
+    const comps = components(adj, nodes);
+    if (comps > 1) {
+      const minLevels = Math.min(aSeen.size || La, bSeen.size || Lb);
+      out.push({ attrA: a, attrB: b, components: comps, severity: comps >= minLevels ? 'full' : 'partial' });
+    }
+  }
+  return out;
+}
+function generateRandomFeasibleDesign(attributes, constraints, J, S, seed) {
+  let t = (seed >>> 0) || 1; const rng = () => { t = (t + 0x6d2b79f5) | 0; let r = Math.imul(t ^ (t >>> 15), 1 | t); r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r; return ((r ^ (r >>> 14)) >>> 0) / 4294967296; };
+  const sizes = attributes.map(a => a.levels.length);
+  const feasible = enumerateFeasibleProfilesC(attributes, constraints, 6000);
+  if (!feasible.length) throw new Error('No feasible profiles after applying constraints.');
+  const draw = () => { for (let k = 0; k < 40; k++) { const p = sizes.map(L => Math.floor(rng() * L)); if (!profileViolatesConstraints(p, constraints)) return p; } return feasible[Math.floor(rng() * feasible.length)].slice(); };
+  const tasks = [];
+  for (let s = 0; s < S; s++) {
+    const task = []; const sigs = new Set(); let safety = 0;
+    while (task.length < J && safety++ < 400) { const p = draw(); const sig = p.join(','); if (sigs.has(sig)) continue; if (taskViolatesConstraints(task.concat([p]), constraints)) continue; sigs.add(sig); task.push(p); }
+    while (task.length < J) task.push(draw());
+    tasks.push(task);
+  }
+  return tasks;
 }
 
 function enumerateFeasibleProfiles(attributes, prohibitions, cap = 4000) {
@@ -1390,18 +1568,18 @@ function dEfficiency(tasks, attributes, layout) {
   return Math.exp(logDet / p) / nObs;
 }
 
-function generateBalancedOverlapDesign(attributes, prohibitions, J, S, seed) {
+function generateBalancedOverlapDesign(attributes, constraints, J, S, seed) {
   const rng = makeRng(seed || 42);
   const sizes = attributes.map(a => a.levels.length);
   // Initialize: pick random feasible profiles uniformly
-  const feasible = enumerateFeasibleProfiles(attributes, prohibitions, Math.min(6000, fullFactorialSize(attributes)));
-  if (feasible.length === 0) throw new Error('No feasible profiles after applying prohibitions.');
+  const feasible = enumerateFeasibleProfilesC(attributes, constraints, Math.min(6000, fullFactorialSize(attributes)));
+  if (feasible.length === 0) throw new Error('No feasible profiles after applying constraints.');
 
   const makeRandomProfile = () => {
     // Favor feasible sampling
     for (let tries = 0; tries < 30; tries++) {
       const p = sizes.map(L => Math.floor(rng() * L));
-      if (!profileViolatesProhibition(p, prohibitions)) return p;
+      if (!profileViolatesConstraints(p, constraints)) return p;
     }
     return feasible[Math.floor(rng() * feasible.length)].slice();
   };
@@ -1416,6 +1594,7 @@ function generateBalancedOverlapDesign(attributes, prohibitions, J, S, seed) {
       const p = makeRandomProfile();
       const sig = p.join(',');
       if (sigSet.has(sig)) continue;
+      if (taskViolatesConstraints(task.concat([p]), constraints)) continue;
       sigSet.add(sig);
       task.push(p);
     }
@@ -1442,12 +1621,13 @@ function generateBalancedOverlapDesign(attributes, prohibitions, J, S, seed) {
     if (newLv === curLv) continue;
     const prof = tasks[ti][ji].slice();
     prof[ai] = newLv;
-    if (profileViolatesProhibition(prof, prohibitions)) continue;
+    if (profileViolatesConstraints(prof, constraints)) continue;
     // avoid making duplicate alternatives within a task
     const taskCopy = tasks[ti].slice();
     taskCopy[ji] = prof;
     const sigSet = new Set(taskCopy.map(p => p.join(',')));
     if (sigSet.size < taskCopy.length) continue;
+    if (taskViolatesConstraints(taskCopy, constraints)) continue;
     const newTasks = tasks.slice();
     newTasks[ti] = taskCopy;
     const newScore = score(newTasks);
@@ -1459,9 +1639,9 @@ function generateBalancedOverlapDesign(attributes, prohibitions, J, S, seed) {
   return tasks;
 }
 
-function generateFederovDesign(attributes, prohibitions, J, S, seed, starts) {
+function generateFederovDesign(attributes, constraints, J, S, seed, starts) {
   const rng = makeRng(seed || 7);
-  const feasible = enumerateFeasibleProfiles(attributes, prohibitions, 4000);
+  const feasible = enumerateFeasibleProfilesC(attributes, constraints, 4000);
   if (feasible.length === 0) throw new Error('No feasible profiles.');
 
   // Build layout for info-matrix computation
@@ -1518,42 +1698,55 @@ function generateFederovDesign(attributes, prohibitions, J, S, seed, starts) {
   return bestTasks;
 }
 
+function _dEffOf(tasks, attributes, J) {
+  const layout = buildParamLayout(attributes, false);
+  const { M } = computeInformationMatrix(tasks, attributes, layout);
+  for (let i = 0; i < layout.nPar; i++) M[i * layout.nPar + i] += 1e-6;
+  const logDet = logDetPD(M, layout.nPar);
+  if (!isFinite(logDet)) return 0;
+  const nObs = tasks.reduce((s, t) => s + t.length, 0);
+  const avgL = mean(attributes.map(a => a.levels.length));
+  const baseline = Math.log((nObs * (J - 1) / J) / avgL);
+  return Math.min(100, Math.max(0, 100 * Math.exp((logDet / layout.nPar) - baseline)));
+}
+
 function generateDesign(study, opts) {
-  const { attributes, prohibitions, choiceConfig } = study;
+  const { attributes, choiceConfig } = study;
+  const constraints = getConstraints(study);
   const J = choiceConfig.altsPerTask;
   const T = choiceConfig.tasksPerRespondent;
   const versions = Math.max(1, opts.versions || 1);
   const S = T * versions; // master tasks total = tasks per respondent × versions
 
-  const hasProhibitions = prohibitions.length > 0;
-  const useFederov = attributes.length <= 6 && !hasProhibitions && opts.useFederov !== false;
+  const hasConstraints = constraints.length > 0;
+  const useFederov = attributes.length <= 6 && !hasConstraints && opts.useFederov !== false;
 
   const seed = opts.seed || Date.now() & 0x7fffffff;
 
   let tasks;
   if (useFederov) {
-    // Federov is expensive; cap starts
-    tasks = generateFederovDesign(attributes, prohibitions, J, S, seed, 25);
+    tasks = generateFederovDesign(attributes, constraints, J, S, seed, 25);
   } else {
-    tasks = generateBalancedOverlapDesign(attributes, prohibitions, J, S, seed);
+    tasks = generateBalancedOverlapDesign(attributes, constraints, J, S, seed);
+  }
+  let algorithm = useFederov ? 'D-efficient Federov (25 starts)' : 'Balanced-overlap with swap optimization';
+
+  // Spec 07 §9: random-feasible benchmark — keep the higher-D-eff design under constraints.
+  if (hasConstraints) {
+    try {
+      const rnd = generateRandomFeasibleDesign(attributes, constraints, J, S, seed ^ 0x5bd1e995);
+      if (_dEffOf(rnd, attributes, J) > _dEffOf(tasks, attributes, J)) {
+        tasks = rnd; algorithm = 'Random-feasible (beat smart optimizer under constraints)';
+      }
+    } catch (e) { /* near-empty feasible space; keep smart design */ }
   }
 
   // Diagnostics
   const layout = buildParamLayout(attributes, false);
   const lb = computeLevelBalance(tasks, attributes);
   const ov = computeOverlap(tasks, attributes);
-  const { M } = computeInformationMatrix(tasks, attributes, layout);
-  for (let i = 0; i < layout.nPar; i++) M[i * layout.nPar + i] += 1e-6;
-  const logDet = logDetPD(M, layout.nPar);
   const nObs = tasks.reduce((s, t) => s + t.length, 0);
-
-  // Baseline: balanced orthogonal design would have info ~ (N/J) * eye(p) after centering.
-  // |M_ideal| ≈ ((N * (J-1) / J) / L_avg)^p approximately; use that for D-eff proxy.
-  const avgL = mean(attributes.map(a => a.levels.length));
-  const baselineInfo = Math.log((nObs * (J - 1) / J) / avgL);
-  const dEff = Math.min(100, Math.max(0, 100 * Math.exp((logDet / layout.nPar) - baselineInfo)));
-
-  const algorithm = useFederov ? 'D-efficient Federov (25 starts)' : 'Balanced-overlap with swap optimization';
+  const dEff = _dEffOf(tasks, attributes, J);
 
   return {
     tasks, seed, algorithm,
@@ -1582,7 +1775,7 @@ function diagnoseDesign(study, design, N) {
   const suggestions = [];
   const attrs = study.attributes || [];
   const cfg = study.choiceConfig || {};
-  const proh = study.prohibitions || [];
+  const cons = getConstraints(study);
   const diag = design.diagnostics;
   const J = cfg.altsPerTask;
   const T = cfg.tasksPerRespondent;
@@ -1664,15 +1857,15 @@ function diagnoseDesign(study, design, N) {
     });
   }
 
-  // Rule 6: Prohibitions too restrictive
-  if (proh.length > 0) {
-    const frac = countProhibitedFraction(attrs, proh);
+  // Rule 6: Constraints too restrictive
+  if (cons.length > 0) {
+    const frac = 1 - feasibilityReport(attrs, cons).fraction;
     if (frac > 0.30) {
       suggestions.push({
         severity: frac > 0.50 ? 'high' : 'medium',
-        category: 'Prohibitions',
-        issue: `Prohibited combinations eliminate ${(frac * 100).toFixed(0)}% of the full factorial. Each prohibition shrinks the feasible design space and drags D-efficiency down.`,
-        suggestion: 'Review each prohibition in Step 2. Prohibitions should encode true clinical or technical infeasibility — not merely unlikely combinations.',
+        category: 'Constraints',
+        issue: `Design rules eliminate ${(frac * 100).toFixed(0)}% of the full factorial. Each rule shrinks the feasible design space and drags D-efficiency down.`,
+        suggestion: 'Review the design rules in Step 2. Constraints should encode true clinical or technical infeasibility — not merely unlikely combinations. Where a rule links two attributes, consider a composite attribute instead.',
         jumpTo: 'attributes'
       });
     }
@@ -1946,7 +2139,7 @@ function buildStudyFromExternal(designRows, dataRows, mapping, opts){
   const now=Date.now();
   return { id:uid(), name:opts.name||'Imported external study', createdAt:now, updatedAt:now, status:'Awaiting Data', studyType:'cbc', source:'external',
     setup:{name:opts.name||'Imported external study',client:'',therapeuticArea:opts.therapeuticArea||'',description:'Imported from external design + field data.',targetRespondentType:''},
-    attributes, prohibitions:[],
+    attributes, prohibitions:[], constraints:[], attributeLinks:[], conditionalPricing:null,
     choiceConfig:{altsPerTask:J,includeNone,noneLabel:'None of these',includeSoC:false,socLabel:'Current Standard of Care',socProfile:null,tasksPerRespondent:T,dualResponse:da.noneMode==='dualNoneCol'},
     design:{tasks,seed:0,algorithm:'Imported external design',diagnostics,versions,tasksPerVersion:T},
     cardStyle:{headerStyle:'letter',customHeaders:[],attributeDisplayNames:{},levelDisplayNames:{},showUnits:true,colorCodedAttrs:{}},
@@ -1978,6 +2171,7 @@ function studyReducer(state, action) {
     case 'SET_SETUP': return { ...state, setup: { ...state.setup, ...action.patch }, updatedAt: Date.now() };
     case 'SET_ATTRIBUTES': return { ...state, attributes: action.attributes, updatedAt: Date.now() };
     case 'SET_PROHIBITIONS': return { ...state, prohibitions: action.prohibitions, updatedAt: Date.now() };
+    case 'SET_CONSTRAINTS': return { ...state, constraints: action.constraints, updatedAt: Date.now() };
     case 'SET_CHOICE': return { ...state, choiceConfig: { ...state.choiceConfig, ...action.patch }, updatedAt: Date.now() };
     case 'SET_DESIGN': return { ...state, design: action.design, updatedAt: Date.now() };
     case 'SET_CARD_STYLE': return { ...state, cardStyle: { ...state.cardStyle, ...action.patch }, updatedAt: Date.now() };
@@ -2006,6 +2200,9 @@ function newStudy(type = 'cbc') {
     },
     attributes: [],
     prohibitions: [],
+    constraints: [],
+    attributeLinks: [],
+    conditionalPricing: null,
     choiceConfig: {
       altsPerTask: DEFAULTS.alternatives.default,
       includeNone: DEFAULTS.noneOption.default,
@@ -2593,6 +2790,7 @@ function Wizard({ studyId, onExit }) {
     setSetup: patch => dispatch({ type: 'SET_SETUP', patch }),
     setAttributes: attrs => dispatch({ type: 'SET_ATTRIBUTES', attributes: attrs }),
     setProhibitions: p => dispatch({ type: 'SET_PROHIBITIONS', prohibitions: p }),
+    setConstraints: c => dispatch({ type: 'SET_CONSTRAINTS', constraints: c }),
     setChoice: patch => dispatch({ type: 'SET_CHOICE', patch }),
     setDesign: d => dispatch({ type: 'SET_DESIGN', design: d }),
     setCardStyle: patch => dispatch({ type: 'SET_CARD_STYLE', patch }),
@@ -3183,8 +3381,19 @@ function ClientFeedbackAgent({ open, onClose }) {
 // ========================================================================
 // SECTION 11 — STEP 2: ATTRIBUTES & LEVELS + PROHIBITED PAIRS
 // ========================================================================
+// Plain-English description of a generalized constraint (spec 07).
+function describeConstraint(c, attrs) {
+  const an = (i) => attrs[i]?.name || `Attr ${i + 1}`;
+  const ln = (ai, li) => li === ANY_LEVEL ? 'any level' : (attrs[ai]?.levels[li]?.name || `Level ${li + 1}`);
+  const term = (t) => `${an(t.attr)} = ${ln(t.attr, t.level)}`;
+  if (c.type === 'prohibit' && c.scope === 'within') return `Never show together: ${c.terms.map(term).join(' + ')}`;
+  if (c.type === 'prohibit' && c.scope === 'between') return `Never in the same task: ${c.groups.map(g => '[' + g.map(term).join(', ') + ']').join(' vs ')}`;
+  if (c.type === 'require') return `If ${term(c.ifTerm)}, then ${an(c.thenAttr)} must be ${c.allowed.map(l => ln(c.thenAttr, l)).join(' / ') || '(none — infeasible!)'}`;
+  if (c.type === 'coOccur') return `Linked: ${term(c.a)} and ${term(c.b)} always appear together or not at all`;
+  return 'Unknown rule';
+}
 function StepAttributes() {
-  const { study, setAttributes, setProhibitions } = useContext(StudyContext);
+  const { study, setAttributes, setProhibitions, setConstraints } = useContext(StudyContext);
   const attrs = study.attributes || [];
   const prohibitions = study.prohibitions || [];
   const [feedbackOpen, setFeedbackOpen] = useState(false);
@@ -3245,12 +3454,7 @@ function StepAttributes() {
   });
   if (factorial > 200)
     advisories.push({ level: 'info', msg: `Your design has ${factorial.toLocaleString()} possible profiles. The tool will generate an efficient fractional factorial design — this is standard practice and does not compromise analysis quality.` });
-  if (viableCount < 20 && factorial > 0)
-    advisories.push({ level: 'danger', msg: `After applying prohibited combinations, only ~${viableCount} viable profiles remain. This may not be sufficient for a robust experimental design. Consider relaxing some prohibitions.` });
-  if (prohibFrac > 0.5)
-    advisories.push({ level: 'danger', msg: `More than half of possible profiles are prohibited (${Math.round(prohibFrac*100)}%). The tool may not be able to generate a design with acceptable efficiency. Strongly recommend reducing prohibitions.` });
-  else if (prohibFrac > 0.3)
-    advisories.push({ level: 'warn', msg: `Prohibited combinations have eliminated ${Math.round(prohibFrac*100)}% of possible profiles. Design efficiency may be significantly reduced. Review your prohibitions to ensure all are strictly necessary.` });
+  // Feasibility / efficiency advisories from constraints are shown in the pre-flight panel below.
 
   // Prohibitions editor
   const addProhibition = () => {
@@ -3261,6 +3465,29 @@ function StepAttributes() {
   };
   const updateProhibition = (id, patch) => setProhibitions(prohibitions.map(p => p.id === id ? { ...p, ...patch } : p));
   const removeProhibition = (id) => setProhibitions(prohibitions.filter(p => p.id !== id));
+
+  // ── Generalized constraints (spec 07): single unified list ──────────────────
+  const cons = (study.constraints && study.constraints.length) ? study.constraints : migrateProhibitions(prohibitions);
+  // Persist to `constraints` and fold in any legacy prohibitions so nothing double-counts.
+  const commitCons = (next) => { setConstraints(next); if (prohibitions.length) setProhibitions([]); };
+  const addConstraint = (type) => {
+    let c;
+    if (type === 'require') c = { id: uid(), type: 'require', ifTerm: { attr: 0, level: 0 }, thenAttr: Math.min(1, attrs.length - 1), allowed: [0], note: '' };
+    else if (type === 'coOccur') c = { id: uid(), type: 'coOccur', a: { attr: 0, level: 0 }, b: { attr: Math.min(1, attrs.length - 1), level: 0 }, note: '' };
+    else if (type === 'between') c = { id: uid(), type: 'prohibit', scope: 'between', groups: [[{ attr: 0, level: 0 }], [{ attr: 0, level: Math.min(1, (attrs[0]?.levels.length || 1) - 1) }]], note: '' };
+    else c = { id: uid(), type: 'prohibit', scope: 'within', terms: [{ attr: 0, level: 0 }, { attr: Math.min(1, attrs.length - 1), level: 0 }], note: '' };
+    commitCons([...cons, c]);
+  };
+  const updateConstraint = (id, next) => commitCons(cons.map(c => c.id === id ? next : c));
+  const removeConstraint = (id) => commitCons(cons.filter(c => c.id !== id));
+
+  const feas = useMemo(() => feasibilityReport(attrs, cons), [attrs, cons]);
+  const aliasing = useMemo(() => detectAliasing(attrs, cons), [attrs, cons]);
+  const attrOpts = attrs.map((a, i) => ({ value: String(i), label: a.name || `Attr ${i + 1}` }));
+  const lvlOpts = (ai, withAny) => {
+    const base = (attrs[ai]?.levels || []).map((l, i) => ({ value: String(i), label: l.name || `Level ${i + 1}` }));
+    return withAny ? [{ value: String(ANY_LEVEL), label: 'Any level' }, ...base] : base;
+  };
 
   return (
     <div>
@@ -3322,44 +3549,114 @@ function StepAttributes() {
       </div>
       <ClientFeedbackAgent open={feedbackOpen} onClose={() => setFeedbackOpen(false)} />
 
+      {/* ── Design rules / constraints (spec 07) ──────────────────────────── */}
       <div className="mt-10">
         <div className="flex items-center justify-between mb-3">
           <div>
-            <h3 className="font-semibold text-slate-900">Prohibited combinations</h3>
-            <p className="text-xs text-slate-500">Pairs of attribute levels that should never appear together on the same product card.</p>
+            <h3 className="font-semibold text-slate-900">Design rules &amp; constraints</h3>
+            <p className="text-xs text-slate-500">Prohibit combinations, require conditional levels, link levels, or set between-concept rules. Use sparingly — each rule can reduce design efficiency.</p>
           </div>
-          <Button variant="secondary" onClick={addProhibition} disabled={attrs.length < 2 || locked}>+ Add rule</Button>
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" onClick={() => addConstraint('prohibitWithin')} disabled={attrs.length < 2 || locked}>+ Prohibit</Button>
+            <Button variant="secondary" onClick={() => addConstraint('require')} disabled={attrs.length < 2 || locked}>+ Require</Button>
+            <Button variant="secondary" onClick={() => addConstraint('coOccur')} disabled={attrs.length < 2 || locked}>+ Linked</Button>
+            <Button variant="secondary" onClick={() => addConstraint('between')} disabled={attrs.length < 1 || locked}>+ Between-concept</Button>
+          </div>
         </div>
 
-        {prohibitions.length === 0 ? (
-          <div className="text-sm text-slate-400 italic py-4 border border-dashed border-slate-200 rounded-lg text-center">No prohibitions defined.</div>
+        {cons.length === 0 ? (
+          <div className="text-sm text-slate-400 italic py-4 border border-dashed border-slate-200 rounded-lg text-center">No constraints defined.</div>
         ) : (
           <div className="space-y-2">
-            {prohibitions.map((p) => (
-              <div key={p.id} className="bg-white border border-slate-200 rounded-lg p-3 flex flex-wrap items-center gap-2">
-                <span className="text-xs text-slate-500 shrink-0">Cannot combine</span>
-                <Select value={String(p.attrA)} onChange={v => updateProhibition(p.id, { attrA: Number(v), levelA: 0 })} options={attrs.map((a, i) => ({ value: String(i), label: a.name || `Attr ${i+1}` }))} className="w-40" />
-                <span className="text-xs text-slate-400">=</span>
-                <Select value={String(p.levelA)} onChange={v => updateProhibition(p.id, { levelA: Number(v) })} options={(attrs[p.attrA]?.levels || []).map((l, i) => ({ value: String(i), label: l.name || `Level ${i+1}` }))} className="w-40" />
-                <span className="text-xs text-slate-500">with</span>
-                <Select value={String(p.attrB)} onChange={v => updateProhibition(p.id, { attrB: Number(v), levelB: 0 })} options={attrs.map((a, i) => ({ value: String(i), label: a.name || `Attr ${i+1}` }))} className="w-40" />
-                <span className="text-xs text-slate-400">=</span>
-                <Select value={String(p.levelB)} onChange={v => updateProhibition(p.id, { levelB: Number(v) })} options={(attrs[p.attrB]?.levels || []).map((l, i) => ({ value: String(i), label: l.name || `Level ${i+1}` }))} className="w-40" />
-                <input className="flex-1 min-w-[120px] px-2 py-1 border border-slate-200 rounded text-xs"
-                  placeholder="Note / justification (optional)" value={p.note || ''} onChange={e => updateProhibition(p.id, { note: e.target.value })} />
-                <button className="text-slate-400 hover:text-red-600" onClick={() => removeProhibition(p.id)}>✕</button>
+            {cons.map((c) => (
+              <div key={c.id} className="bg-white border border-slate-200 rounded-lg p-3">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <span className="text-[10px] font-mono uppercase tracking-wide px-1.5 py-0.5 bg-slate-200 text-slate-700 rounded">
+                    {c.type === 'prohibit' ? (c.scope === 'between' ? 'between' : 'prohibit') : c.type}
+                  </span>
+                  <span className="text-xs text-slate-600 flex-1 truncate">{describeConstraint(c, attrs)}</span>
+                  <button className="text-slate-400 hover:text-red-600" onClick={() => removeConstraint(c.id)} disabled={locked}>✕</button>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {/* prohibit / within (n-way) */}
+                  {c.type === 'prohibit' && c.scope === 'within' && (<>
+                    {c.terms.map((t, ti) => (
+                      <span key={ti} className="flex items-center gap-1">
+                        {ti > 0 && <span className="text-xs text-slate-400">and</span>}
+                        <Select value={String(t.attr)} onChange={v => { const terms = c.terms.slice(); terms[ti] = { attr: Number(v), level: 0 }; updateConstraint(c.id, { ...c, terms }); }} options={attrOpts} className="w-36" />
+                        <span className="text-xs text-slate-400">=</span>
+                        <Select value={String(t.level)} onChange={v => { const terms = c.terms.slice(); terms[ti] = { ...terms[ti], level: Number(v) }; updateConstraint(c.id, { ...c, terms }); }} options={lvlOpts(t.attr, true)} className="w-36" />
+                        {c.terms.length > 2 && <button className="text-slate-300 hover:text-red-500 text-xs" onClick={() => updateConstraint(c.id, { ...c, terms: c.terms.filter((_, k) => k !== ti) })}>✕</button>}
+                      </span>
+                    ))}
+                    <button className="text-xs text-blue-600 hover:text-blue-700" onClick={() => updateConstraint(c.id, { ...c, terms: [...c.terms, { attr: 0, level: 0 }] })}>+ term</button>
+                  </>)}
+
+                  {/* require */}
+                  {c.type === 'require' && (<>
+                    <span className="text-xs text-slate-500">If</span>
+                    <Select value={String(c.ifTerm.attr)} onChange={v => updateConstraint(c.id, { ...c, ifTerm: { attr: Number(v), level: 0 } })} options={attrOpts} className="w-36" />
+                    <span className="text-xs text-slate-400">=</span>
+                    <Select value={String(c.ifTerm.level)} onChange={v => updateConstraint(c.id, { ...c, ifTerm: { ...c.ifTerm, level: Number(v) } })} options={lvlOpts(c.ifTerm.attr, false)} className="w-32" />
+                    <span className="text-xs text-slate-500">then</span>
+                    <Select value={String(c.thenAttr)} onChange={v => updateConstraint(c.id, { ...c, thenAttr: Number(v), allowed: [0] })} options={attrOpts} className="w-36" />
+                    <span className="text-xs text-slate-500">must be:</span>
+                    {(attrs[c.thenAttr]?.levels || []).map((l, li) => (
+                      <label key={li} className="flex items-center gap-1 text-xs text-slate-600">
+                        <input type="checkbox" checked={c.allowed.includes(li)} onChange={e => { const set = new Set(c.allowed); e.target.checked ? set.add(li) : set.delete(li); updateConstraint(c.id, { ...c, allowed: [...set].sort((a, b) => a - b) }); }} />
+                        {l.name || `L${li + 1}`}
+                      </label>
+                    ))}
+                  </>)}
+
+                  {/* coOccur */}
+                  {c.type === 'coOccur' && (<>
+                    <Select value={String(c.a.attr)} onChange={v => updateConstraint(c.id, { ...c, a: { attr: Number(v), level: 0 } })} options={attrOpts} className="w-36" />
+                    <span className="text-xs text-slate-400">=</span>
+                    <Select value={String(c.a.level)} onChange={v => updateConstraint(c.id, { ...c, a: { ...c.a, level: Number(v) } })} options={lvlOpts(c.a.attr, false)} className="w-32" />
+                    <span className="text-xs text-slate-500">always with</span>
+                    <Select value={String(c.b.attr)} onChange={v => updateConstraint(c.id, { ...c, b: { attr: Number(v), level: 0 } })} options={attrOpts} className="w-36" />
+                    <span className="text-xs text-slate-400">=</span>
+                    <Select value={String(c.b.level)} onChange={v => updateConstraint(c.id, { ...c, b: { ...c.b, level: Number(v) } })} options={lvlOpts(c.b.attr, false)} className="w-32" />
+                  </>)}
+
+                  {/* between-concept */}
+                  {c.type === 'prohibit' && c.scope === 'between' && (<>
+                    <span className="text-xs text-slate-500">Never together in a task:</span>
+                    {c.groups.map((g, gi) => (
+                      <span key={gi} className="flex items-center gap-1">
+                        {gi > 0 && <span className="text-xs text-slate-400">vs</span>}
+                        <Select value={String(g[0].attr)} onChange={v => { const groups = c.groups.map(x => x.slice()); groups[gi] = [{ attr: Number(v), level: 0 }]; updateConstraint(c.id, { ...c, groups }); }} options={attrOpts} className="w-32" />
+                        <span className="text-xs text-slate-400">=</span>
+                        <Select value={String(g[0].level)} onChange={v => { const groups = c.groups.map(x => x.slice()); groups[gi] = [{ ...g[0], level: Number(v) }]; updateConstraint(c.id, { ...c, groups }); }} options={lvlOpts(g[0].attr, false)} className="w-32" />
+                      </span>
+                    ))}
+                  </>)}
+
+                  <input className="flex-1 min-w-[120px] px-2 py-1 border border-slate-200 rounded text-xs" placeholder="Note (optional)" value={c.note || ''} onChange={e => updateConstraint(c.id, { ...c, note: e.target.value })} />
+                </div>
               </div>
             ))}
           </div>
         )}
       </div>
 
+      {/* ── Pre-flight: feasibility + aliasing (spec 07 §8) ─────────────────── */}
       {attrs.length >= 2 && (
-        <div className="mt-8 bg-slate-100 rounded-xl p-4 text-sm">
-          <div className="flex items-center gap-6 text-slate-700 tabular">
-            <div><span className="text-slate-500 text-xs">Full factorial:</span> <strong>{factorial.toLocaleString()}</strong> profiles</div>
-            <div><span className="text-slate-500 text-xs">Viable after prohibitions:</span> <strong>{viableCount.toLocaleString()}</strong> ({Math.round((1-prohibFrac)*100)}%)</div>
+        <div className="mt-8 space-y-3">
+          <div className="bg-slate-100 rounded-xl p-4 text-sm">
+            <div className="flex items-center gap-6 text-slate-700 tabular flex-wrap">
+              <div><span className="text-slate-500 text-xs">Full factorial:</span> <strong>{factorial.toLocaleString()}</strong> profiles</div>
+              <div><span className="text-slate-500 text-xs">Feasible after rules:</span> <strong>{feas.feasible.toLocaleString()}</strong> ({Math.round(feas.fraction * 100)}%{feas.exact ? '' : ' est.'})</div>
+            </div>
           </div>
+          {feas.empty && <Advisory level="danger"><strong>No feasible profiles.</strong> The current rules eliminate every possible product. Relax a constraint before generating a design.</Advisory>}
+          {!feas.empty && feas.fraction < 0.5 && feas.fraction > 0 && <Advisory level="warn">Rules remove {Math.round((1 - feas.fraction) * 100)}% of profiles. Heavy constraints reduce design efficiency — prefer conditional pricing or a composite over prohibitions where possible.</Advisory>}
+          {aliasing.map((w, i) => (
+            <Advisory key={i} level={w.severity === 'full' ? 'danger' : 'warn'}>
+              <strong>{w.severity === 'full' ? 'Confounded:' : 'Partial confound:'}</strong> the rules tie <em>{attrs[w.attrA]?.name || `Attr ${w.attrA + 1}`}</em> and <em>{attrs[w.attrB]?.name || `Attr ${w.attrB + 1}`}</em> together so their separate part-worths {w.severity === 'full' ? 'cannot be estimated' : 'may not be reliably estimated'}. Consider modeling them as one bundled (composite) attribute instead.
+            </Advisory>
+          ))}
         </div>
       )}
     </div>
@@ -3949,7 +4246,7 @@ function StepDesign() {
         type: 'run',
         payload: {
           attributes: attrs,
-          prohibitions: study.prohibitions || [],
+          constraints: getConstraints(study),
           choiceConfig: cfg,
           versions,
           weights: w,
