@@ -1278,6 +1278,115 @@ function generateRandomFeasibleDesign(attributes, constraints, J, S, seed) {
   return tasks;
 }
 
+// ===== Conditional pricing (mirror of src/lib/conditionalPricing.ts) =====
+function roundPrice(v, mode){ if(mode==='nearestDollar') return Math.round(v); if(mode==='nearest9c') return Math.floor(v)+0.99; return v; }
+function formatPrice(v){ if(Math.abs(v)>=100||Number.isInteger(v)) return '$'+Math.round(v).toLocaleString(); return '$'+v.toFixed(2); }
+function buildProportionalValues(basePrices, deltas, rounding){ return basePrices.map(base => deltas.map(d => roundPrice(base*(1+d), rounding))); }
+function valuesToTable(values){ return values.map(row => row.map(v => formatPrice(v))); }
+function detectAsymmetry(values){
+  const C=values.length; if(C<2) return false; const P=values[0].length; if(P<2) return false; const tol=0.02;
+  let proportional=true;
+  for(let p=1;p<P&&proportional;p++){ const r0=values[0][p]/(values[0][0]||1e-9); for(let c=1;c<C;c++){ const r=values[c][p]/(values[c][0]||1e-9); if(Math.abs(r-r0)>tol*Math.max(1,Math.abs(r0))){proportional=false;break;} } }
+  let absolute=true;
+  for(let p=1;p<P&&absolute;p++){ const d0=values[0][p]-values[0][0]; for(let c=1;c<C;c++){ const d=values[c][p]-values[c][0]; if(Math.abs(d-d0)>Math.max(1,Math.abs(d0))*0.01+1e-9){absolute=false;break;} } }
+  return !(proportional||absolute);
+}
+function makeDefaultCondPricing(priceLevels, condLevels, priceAttr, conditioningAttr){
+  const basePrices=new Array(condLevels).fill(100);
+  const deltas = priceLevels===1 ? [0] : Array.from({length:priceLevels},(_,i)=>(i/(priceLevels-1)-0.5)*0.6);
+  const rounding='nearestDollar';
+  const values=buildProportionalValues(basePrices,deltas,rounding);
+  return { priceAttr, conditioningAttr, mode:'proportional', basePrices, deltas, values, table:valuesToTable(values), asymmetric:detectAsymmetry(values), rounding };
+}
+function recomputeCondPricing(cp){
+  const values = cp.mode==='proportional' ? buildProportionalValues(cp.basePrices, cp.deltas, cp.rounding) : cp.values;
+  return { ...cp, values, table:valuesToTable(values), asymmetric:detectAsymmetry(values) };
+}
+function lookupConditionalPrice(cp, profile, attrIndex){
+  if(!cp || cp.priceAttr!==attrIndex || !profile) return null;
+  const t = cp.table && cp.table[profile[cp.conditioningAttr]] && cp.table[profile[cp.conditioningAttr]][profile[attrIndex]];
+  return (t!=null && t!=='') ? t : null;
+}
+function lookupConditionalValue(cp, profile){
+  if(!cp || !profile) return null;
+  const v = cp.values && cp.values[profile[cp.conditioningAttr]] && cp.values[profile[cp.conditioningAttr]][profile[cp.priceAttr]];
+  return (typeof v==='number') ? v : null;
+}
+
+// ===== Composite / bundled attributes (mirror of src/lib/composites.ts) =====
+function collapse(attributes, links) {
+  const valid = (links || []).filter(l => l.attrA !== l.attrB && attributes[l.attrA] && attributes[l.attrB] && l.pairs && l.pairs.length);
+  const bundled = new Set(); const partner = new Map();
+  for (const l of valid) { if (bundled.has(l.attrA) || bundled.has(l.attrB)) continue; bundled.add(l.attrA); bundled.add(l.attrB); partner.set(Math.min(l.attrA, l.attrB), l); }
+  const cAttrs = []; const meta = [];
+  for (let i = 0; i < attributes.length; i++) {
+    if (!bundled.has(i)) { cAttrs.push(attributes[i]); meta.push({ kind: 'pass', orig: i }); continue; }
+    const lk = partner.get(i); if (!lk) continue;
+    const A = attributes[lk.attrA], B = attributes[lk.attrB];
+    cAttrs.push({ name: `${A.name} + ${B.name}`, isPrice: false, levels: lk.pairs.map(([la, lb]) => ({ name: `${A.levels[la]?.name || 'A' + (la + 1)} · ${B.levels[lb]?.name || 'B' + (lb + 1)}` })) });
+    meta.push({ kind: 'composite', attrA: lk.attrA, attrB: lk.attrB, pairs: lk.pairs });
+  }
+  return { attributes: cAttrs, map: { origCount: attributes.length, meta, bundled } };
+}
+function hasBundles(map) { return map.meta.some(m => m.kind === 'composite'); }
+function collapseProfile(orig, map) {
+  return map.meta.map(m => { if (m.kind === 'pass') return orig[m.orig]; const la = orig[m.attrA], lb = orig[m.attrB]; return m.pairs.findIndex(p => p[0] === la && p[1] === lb); });
+}
+function expandProfile(c, map) {
+  const out = new Array(map.origCount).fill(0);
+  map.meta.forEach((m, ci) => { if (m.kind === 'pass') out[m.orig] = c[ci]; else { const pair = m.pairs[c[ci]] || m.pairs[0]; out[m.attrA] = pair[0]; out[m.attrB] = pair[1]; } });
+  return out;
+}
+function collapseTasks(tasks, map) { return tasks.map(t => t.map(p => collapseProfile(p, map))); }
+function expandTasks(tasks, map) { return tasks.map(t => t.map(p => expandProfile(p, map))); }
+function remapConstraintsToCollapsed(constraints, map) {
+  const o2c = new Map(); map.meta.forEach((m, ci) => { if (m.kind === 'pass') o2c.set(m.orig, ci); });
+  const rt = t => map.bundled.has(t.attr) ? null : { attr: o2c.get(t.attr), level: t.level };
+  const out = [];
+  for (const c of constraints) {
+    const rc = { ...c }; let drop = false;
+    if (c.type === 'prohibit' && c.scope === 'within') { const terms = c.terms.map(rt); if (terms.some(x => !x)) drop = true; else rc.terms = terms; }
+    else if (c.type === 'prohibit' && c.scope === 'between') { const groups = c.groups.map(g => g.map(rt)); if (groups.some(g => g.some(x => !x))) drop = true; else rc.groups = groups; }
+    else if (c.type === 'require') { const it = rt(c.ifTerm); if (!it || map.bundled.has(c.thenAttr)) drop = true; else { rc.ifTerm = it; rc.thenAttr = o2c.get(c.thenAttr); } }
+    else if (c.type === 'coOccur') { const a = rt(c.a), b = rt(c.b); if (!a || !b) drop = true; else { rc.a = a; rc.b = b; } }
+    if (!drop) out.push(rc);
+  }
+  return out;
+}
+function _pairGraphComponents(pairs, La, Lb) {
+  const adj = new Map(); const nodes = [];
+  for (let i = 0; i < La; i++) { adj.set(i, new Set()); nodes.push(i); }
+  for (let j = 0; j < Lb; j++) { adj.set(La + j, new Set()); nodes.push(La + j); }
+  for (const [la, lb] of pairs) { adj.get(la).add(La + lb); adj.get(La + lb).add(la); }
+  const seen = new Set(); let comps = 0;
+  for (const s of nodes) { if (!adj.get(s).size || seen.has(s)) continue; comps++; const st = [s]; seen.add(s); while (st.length) { const u = st.pop(); for (const v of adj.get(u)) if (!seen.has(v)) { seen.add(v); st.push(v); } } }
+  return comps;
+}
+function _solveLS(X, y, ridge) {
+  const n = X.length, p = X[0].length;
+  const XtX = Array.from({ length: p }, () => new Array(p).fill(0)); const Xty = new Array(p).fill(0);
+  for (let i = 0; i < n; i++) for (let a = 0; a < p; a++) { Xty[a] += X[i][a] * y[i]; for (let b = 0; b < p; b++) XtX[a][b] += X[i][a] * X[i][b]; }
+  for (let a = 0; a < p; a++) XtX[a][a] += ridge;
+  const M = XtX.map((row, i) => [...row, Xty[i]]);
+  for (let col = 0; col < p; col++) { let piv = col; for (let r = col + 1; r < p; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r; [M[col], M[piv]] = [M[piv], M[col]]; const d = M[col][col] || 1e-12; for (let cc = col; cc <= p; cc++) M[col][cc] /= d; for (let r = 0; r < p; r++) if (r !== col) { const f = M[r][col]; for (let cc = col; cc <= p; cc++) M[r][cc] -= f * M[col][cc]; } }
+  return M.map(row => row[p]);
+}
+function buildDecomposer(pairs, La, Lb) {
+  const refA = La - 1, refB = Lb - 1, aCols = La - 1, bCols = Lb - 1, P = 1 + aCols + bCols;
+  const X = pairs.map(([la, lb]) => { const row = new Array(P).fill(0); row[0] = 1; if (la !== refA) row[1 + la] = 1; if (lb !== refB) row[1 + aCols + lb] = 1; return row; });
+  const identified = _pairGraphComponents(pairs, La, Lb) <= 1; const ridge = identified ? 1e-9 : 1e-6;
+  return {
+    La, Lb, identified,
+    apply(u) {
+      const coef = _solveLS(X, u, ridge); const a = new Array(La).fill(0); const b = new Array(Lb).fill(0);
+      for (let la = 0; la < La; la++) a[la] = la === refA ? 0 : coef[1 + la];
+      for (let lb = 0; lb < Lb; lb++) b[lb] = lb === refB ? 0 : coef[1 + aCols + lb];
+      let ss = 0; for (let i = 0; i < u.length; i++) { let pred = 0; for (let c = 0; c < P; c++) pred += X[i][c] * coef[c]; ss += (pred - u[i]) * (pred - u[i]); }
+      return { a, b, residual: Math.sqrt(ss / Math.max(1, u.length)) };
+    },
+  };
+}
+
 function enumerateFeasibleProfiles(attributes, prohibitions, cap = 4000) {
   // Enumerate full factorial up to cap; if larger, sample
   const sizes = attributes.map(a => a.levels.length);
@@ -1487,11 +1596,15 @@ function invertPDFromCholesky(M, n) {
  */
 function computeParameterPrecision(study, design, N, priorVar) {
   if (!design?.tasks || !N || N <= 0) return null;
-  const attrs = study.attributes || [];
+  // Composites: precision in collapsed space (original is singular for bundles).
+  const _cp = collapse(study.attributes || [], study.attributeLinks || []);
+  const _bundled = hasBundles(_cp.map);
+  const attrs = _bundled ? _cp.attributes : (study.attributes || []);
+  const _tasks = _bundled ? collapseTasks(design.tasks, _cp.map) : design.tasks;
   const layout = buildParamLayout(attrs, false);
   const p = layout.nPar;
   if (p === 0) return null;
-  const { M } = computeInformationMatrix(design.tasks, attrs, layout);
+  const { M } = computeInformationMatrix(_tasks, attrs, layout);
   // Bayesian regularization: M_post = M + (1/priorVar)·I.
   // priorVar = 2.0 matches the HB sampler's default Normal(0, 2) prior on β. With priorVar = 0,
   // falls back to a tiny numerical ridge (1e-6) for compatibility with strict OLS Fisher info.
@@ -1718,35 +1831,42 @@ function generateDesign(study, opts) {
   const versions = Math.max(1, opts.versions || 1);
   const S = T * versions; // master tasks total = tasks per respondent × versions
 
-  const hasConstraints = constraints.length > 0;
-  const useFederov = attributes.length <= 6 && !hasConstraints && opts.useFederov !== false;
+  // Composites (spec 07 §5): generate collapsed (valid pairs only), store expanded.
+  const { attributes: cAttrs, map } = collapse(attributes, study.attributeLinks || []);
+  const bundled = hasBundles(map);
+  const genAttrs = bundled ? cAttrs : attributes;
+  const genCons = bundled ? remapConstraintsToCollapsed(constraints, map) : constraints;
+
+  const hasConstraints = genCons.length > 0;
+  const useFederov = genAttrs.length <= 6 && !hasConstraints && opts.useFederov !== false;
 
   const seed = opts.seed || Date.now() & 0x7fffffff;
 
-  let tasks;
+  let gtasks;
   if (useFederov) {
-    tasks = generateFederovDesign(attributes, constraints, J, S, seed, 25);
+    gtasks = generateFederovDesign(genAttrs, genCons, J, S, seed, 25);
   } else {
-    tasks = generateBalancedOverlapDesign(attributes, constraints, J, S, seed);
+    gtasks = generateBalancedOverlapDesign(genAttrs, genCons, J, S, seed);
   }
   let algorithm = useFederov ? 'D-efficient Federov (25 starts)' : 'Balanced-overlap with swap optimization';
 
   // Spec 07 §9: random-feasible benchmark — keep the higher-D-eff design under constraints.
   if (hasConstraints) {
     try {
-      const rnd = generateRandomFeasibleDesign(attributes, constraints, J, S, seed ^ 0x5bd1e995);
-      if (_dEffOf(rnd, attributes, J) > _dEffOf(tasks, attributes, J)) {
-        tasks = rnd; algorithm = 'Random-feasible (beat smart optimizer under constraints)';
+      const rnd = generateRandomFeasibleDesign(genAttrs, genCons, J, S, seed ^ 0x5bd1e995);
+      if (_dEffOf(rnd, genAttrs, J) > _dEffOf(gtasks, genAttrs, J)) {
+        gtasks = rnd; algorithm = 'Random-feasible (beat smart optimizer under constraints)';
       }
     } catch (e) { /* near-empty feasible space; keep smart design */ }
   }
+  if (bundled) algorithm += ' · composite attributes';
 
-  // Diagnostics
-  const layout = buildParamLayout(attributes, false);
+  // D-efficiency in collapsed space (original is singular for bundles); store + report expanded.
+  const dEff = _dEffOf(gtasks, genAttrs, J);
+  const tasks = bundled ? expandTasks(gtasks, map) : gtasks;
   const lb = computeLevelBalance(tasks, attributes);
   const ov = computeOverlap(tasks, attributes);
   const nObs = tasks.reduce((s, t) => s + t.length, 0);
-  const dEff = _dEffOf(tasks, attributes, J);
 
   return {
     tasks, seed, algorithm,
@@ -2172,6 +2292,8 @@ function studyReducer(state, action) {
     case 'SET_ATTRIBUTES': return { ...state, attributes: action.attributes, updatedAt: Date.now() };
     case 'SET_PROHIBITIONS': return { ...state, prohibitions: action.prohibitions, updatedAt: Date.now() };
     case 'SET_CONSTRAINTS': return { ...state, constraints: action.constraints, updatedAt: Date.now() };
+    case 'SET_CONDITIONAL_PRICING': return { ...state, conditionalPricing: action.value, updatedAt: Date.now() };
+    case 'SET_ATTRIBUTE_LINKS': return { ...state, attributeLinks: action.links, updatedAt: Date.now() };
     case 'SET_CHOICE': return { ...state, choiceConfig: { ...state.choiceConfig, ...action.patch }, updatedAt: Date.now() };
     case 'SET_DESIGN': return { ...state, design: action.design, updatedAt: Date.now() };
     case 'SET_CARD_STYLE': return { ...state, cardStyle: { ...state.cardStyle, ...action.patch }, updatedAt: Date.now() };
@@ -2791,6 +2913,8 @@ function Wizard({ studyId, onExit }) {
     setAttributes: attrs => dispatch({ type: 'SET_ATTRIBUTES', attributes: attrs }),
     setProhibitions: p => dispatch({ type: 'SET_PROHIBITIONS', prohibitions: p }),
     setConstraints: c => dispatch({ type: 'SET_CONSTRAINTS', constraints: c }),
+    setConditionalPricing: v => dispatch({ type: 'SET_CONDITIONAL_PRICING', value: v }),
+    setAttributeLinks: l => dispatch({ type: 'SET_ATTRIBUTE_LINKS', links: l }),
     setChoice: patch => dispatch({ type: 'SET_CHOICE', patch }),
     setDesign: d => dispatch({ type: 'SET_DESIGN', design: d }),
     setCardStyle: patch => dispatch({ type: 'SET_CARD_STYLE', patch }),
@@ -3393,7 +3517,7 @@ function describeConstraint(c, attrs) {
   return 'Unknown rule';
 }
 function StepAttributes() {
-  const { study, setAttributes, setProhibitions, setConstraints } = useContext(StudyContext);
+  const { study, setAttributes, setProhibitions, setConstraints, setConditionalPricing, setAttributeLinks } = useContext(StudyContext);
   const attrs = study.attributes || [];
   const prohibitions = study.prohibitions || [];
   const [feedbackOpen, setFeedbackOpen] = useState(false);
@@ -3483,6 +3607,42 @@ function StepAttributes() {
 
   const feas = useMemo(() => feasibilityReport(attrs, cons), [attrs, cons]);
   const aliasing = useMemo(() => detectAliasing(attrs, cons), [attrs, cons]);
+
+  // ── Conditional pricing (spec 07 §6) ────────────────────────────────────────
+  const priceAttrIdx = attrs.findIndex(a => a.isPrice);
+  const cp = study.conditionalPricing;
+  const enableCP = () => {
+    const cond = attrs.findIndex((a, i) => i !== priceAttrIdx);
+    if (priceAttrIdx < 0 || cond < 0) return;
+    setConditionalPricing(makeDefaultCondPricing(attrs[priceAttrIdx].levels.length, attrs[cond].levels.length, priceAttrIdx, cond));
+  };
+  const setCondAttr = (ci) => setConditionalPricing(makeDefaultCondPricing(attrs[priceAttrIdx].levels.length, attrs[ci].levels.length, priceAttrIdx, ci));
+  const setBase = (c, val) => { const basePrices = cp.basePrices.slice(); basePrices[c] = Number(val) || 0; setConditionalPricing(recomputeCondPricing({ ...cp, mode: 'proportional', basePrices })); };
+  const setDeltaPct = (p, val) => { const deltas = cp.deltas.slice(); deltas[p] = (Number(val) || 0) / 100; setConditionalPricing(recomputeCondPricing({ ...cp, mode: 'proportional', deltas })); };
+  const setCell = (c, p, val) => { const values = cp.values.map(r => r.slice()); values[c][p] = Number(val) || 0; setConditionalPricing(recomputeCondPricing({ ...cp, mode: 'manual', values })); };
+
+  // ── Bundled / composite attributes (spec 07 §5) ─────────────────────────────
+  const links = study.attributeLinks || [];
+  const inBundle = new Set();
+  links.forEach(l => { inBundle.add(l.attrA); inBundle.add(l.attrB); });
+  const addLink = () => {
+    const a = attrs.findIndex((_, i) => !inBundle.has(i));
+    const b = attrs.findIndex((_, i) => i !== a && !inBundle.has(i));
+    if (a < 0 || b < 0) return;
+    // default valid pairs = diagonal (1:1) where possible, else full grid
+    const La = attrs[a].levels.length, Lb = attrs[b].levels.length;
+    const pairs = [];
+    for (let la = 0; la < La; la++) for (let lb = 0; lb < Lb; lb++) pairs.push([la, lb]);
+    setAttributeLinks([...links, { id: uid(), attrA: a, attrB: b, pairs, note: '' }]);
+  };
+  const updateLink = (id, next) => setAttributeLinks(links.map(l => l.id === id ? next : l));
+  const removeLink = (id) => setAttributeLinks(links.filter(l => l.id !== id));
+  const togglePair = (l, la, lb) => {
+    const has = l.pairs.some(p => p[0] === la && p[1] === lb);
+    const pairs = has ? l.pairs.filter(p => !(p[0] === la && p[1] === lb)) : [...l.pairs, [la, lb]];
+    updateLink(l.id, { ...l, pairs });
+  };
+  const linkAvailable = attrs.filter((_, i) => !inBundle.has(i)).length >= 2;
   const attrOpts = attrs.map((a, i) => ({ value: String(i), label: a.name || `Attr ${i + 1}` }));
   const lvlOpts = (ai, withAny) => {
     const base = (attrs[ai]?.levels || []).map((l, i) => ({ value: String(i), label: l.name || `Level ${i + 1}` }));
@@ -3659,6 +3819,129 @@ function StepAttributes() {
           ))}
         </div>
       )}
+
+      {/* ── Conditional pricing (spec 07 §6) ───────────────────────────────── */}
+      {priceAttrIdx >= 0 && attrs.length >= 2 && (
+        <div className="mt-10">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-slate-900">Conditional pricing</h3>
+              <p className="text-xs text-slate-500">Show realistic prices that depend on another attribute — without price prohibitions. Price stays as its original levels for analysis.</p>
+            </div>
+            {cp
+              ? <Button variant="ghost" onClick={() => setConditionalPricing(null)} disabled={locked}>Turn off</Button>
+              : <Button variant="secondary" onClick={enableCP} disabled={locked}>Enable</Button>}
+          </div>
+
+          {cp && (
+            <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-slate-500">Price (<strong>{attrs[priceAttrIdx]?.name || 'Price'}</strong>) depends on</span>
+                <Select value={String(cp.conditioningAttr)} onChange={v => setCondAttr(Number(v))}
+                  options={attrs.map((a, i) => ({ value: String(i), label: a.name || `Attr ${i + 1}` })).filter((o) => Number(o.value) !== priceAttrIdx)} className="w-44" />
+                <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">{cp.mode}</span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="text-xs border-collapse">
+                  <thead>
+                    <tr>
+                      <th className="p-1.5 text-left text-slate-400 font-normal">{attrs[cp.conditioningAttr]?.name} ↓ / {attrs[priceAttrIdx]?.name} →</th>
+                      {(attrs[priceAttrIdx]?.levels || []).map((l, p) => (
+                        <th key={p} className="p-1.5 text-center">
+                          <div className="text-slate-700">{l.name || `L${p + 1}`}</div>
+                          <div className="text-slate-400 font-normal mt-0.5">
+                            <input type="number" className="w-16 px-1 py-0.5 border border-slate-200 rounded text-center" value={Math.round(cp.deltas[p] * 100)} onChange={e => setDeltaPct(p, e.target.value)} />%
+                          </div>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(attrs[cp.conditioningAttr]?.levels || []).map((cl, c) => (
+                      <tr key={c} className="border-t border-slate-100">
+                        <td className="p-1.5 text-slate-700">
+                          {cl.name || `L${c + 1}`}
+                          <input type="number" className="ml-2 w-20 px-1 py-0.5 border border-slate-200 rounded" value={cp.basePrices[c]} onChange={e => setBase(c, e.target.value)} title="Base price" />
+                        </td>
+                        {(attrs[priceAttrIdx]?.levels || []).map((_, p) => (
+                          <td key={p} className="p-1.5 text-center">
+                            <input type="number" className="w-20 px-1 py-0.5 border border-slate-200 rounded text-center" value={cp.values[c]?.[p] ?? 0} onChange={e => setCell(c, p, e.target.value)} />
+                            <div className="text-[10px] text-slate-400">{cp.table[c]?.[p]}</div>
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="text-[11px] text-slate-400">Edit the % row + base column for a proportional table, or any cell for a custom (manual) table.</div>
+              {cp.asymmetric && (
+                <Advisory level="warn"><strong>Asymmetric table.</strong> A price × {attrs[cp.conditioningAttr]?.name || 'conditioning'} interaction term is required to fit this correctly — a symmetric (proportional or constant-step) table can be fit with main effects only.</Advisory>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Bundled (composite) attributes (spec 07 §5) ────────────────────── */}
+      {attrs.length >= 2 && (
+        <div className="mt-10">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-slate-900">Bundled attributes</h3>
+              <p className="text-xs text-slate-500">Link two attributes whose levels move together. Only the valid level-pairs you check below will appear in the design; their part-worths are estimated jointly and split back out where statistically possible.</p>
+            </div>
+            <Button variant="secondary" onClick={addLink} disabled={!linkAvailable || locked}>+ Add bundle</Button>
+          </div>
+
+          {links.length === 0 ? (
+            <div className="text-sm text-slate-400 italic py-4 border border-dashed border-slate-200 rounded-lg text-center">No bundled attributes.</div>
+          ) : (
+            <div className="space-y-3">
+              {links.map((l) => {
+                const A = attrs[l.attrA], B = attrs[l.attrB];
+                const otherAttrOpts = (exclude) => attrs.map((a, i) => ({ value: String(i), label: a.name || `Attr ${i + 1}` })).filter(o => Number(o.value) === (exclude === 'A' ? l.attrA : l.attrB) || (!inBundle.has(Number(o.value))));
+                return (
+                  <div key={l.id} className="bg-white border border-slate-200 rounded-lg p-3">
+                    <div className="flex items-center gap-2 flex-wrap mb-2">
+                      <span className="text-xs text-slate-500">Bundle</span>
+                      <Select value={String(l.attrA)} onChange={v => { const a = Number(v); const La = attrs[a].levels.length, Lb = attrs[l.attrB].levels.length; const pairs = []; for (let x = 0; x < La; x++) for (let y = 0; y < Lb; y++) pairs.push([x, y]); updateLink(l.id, { ...l, attrA: a, pairs }); }} options={otherAttrOpts('A')} className="w-40" />
+                      <span className="text-xs text-slate-400">with</span>
+                      <Select value={String(l.attrB)} onChange={v => { const b = Number(v); const La = attrs[l.attrA].levels.length, Lb = attrs[b].levels.length; const pairs = []; for (let x = 0; x < La; x++) for (let y = 0; y < Lb; y++) pairs.push([x, y]); updateLink(l.id, { ...l, attrB: b, pairs }); }} options={otherAttrOpts('B')} className="w-40" />
+                      <button className="text-slate-400 hover:text-red-600 ml-auto" onClick={() => removeLink(l.id)} disabled={locked}>✕</button>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="text-xs border-collapse">
+                        <thead>
+                          <tr>
+                            <th className="p-1 text-left text-slate-400 font-normal">{A?.name} ↓ / {B?.name} →</th>
+                            {(B?.levels || []).map((bl, lb) => <th key={lb} className="p-1 text-center text-slate-600">{bl.name || `B${lb + 1}`}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(A?.levels || []).map((al, la) => (
+                            <tr key={la}>
+                              <td className="p-1 text-slate-600">{al.name || `A${la + 1}`}</td>
+                              {(B?.levels || []).map((_, lb) => (
+                                <td key={lb} className="p-1 text-center">
+                                  <input type="checkbox" checked={l.pairs.some(p => p[0] === la && p[1] === lb)} onChange={() => togglePair(l, la, lb)} disabled={locked} />
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="text-[11px] text-slate-400 mt-1">{l.pairs.length} valid pair{l.pairs.length === 1 ? '' : 's'} · constraints referencing bundled attributes are ignored.</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -3671,7 +3954,9 @@ function ChoiceTaskPreview({ study, sampleProfiles }) {
   const attrs = study.attributes;
   const cs = study.cardStyle || {};
   const displayName = (attr) => cs.attributeDisplayNames?.[attr.id] || attr.name || 'Attribute';
-  const displayLevel = (attr, li) => {
+  const displayLevel = (attr, li, profile, ai) => {
+    const cprice = lookupConditionalPrice(study.conditionalPricing, profile, ai);
+    if (cprice != null) return cprice;
     const ov = cs.levelDisplayNames?.[attr.id]?.[attr.levels[li]?.id];
     return ov || attr.levels[li]?.name || `Level ${li + 1}`;
   };
@@ -3691,7 +3976,7 @@ function ChoiceTaskPreview({ study, sampleProfiles }) {
             {attrs.map((a, ai) => (
               <div key={a.id} className="text-xs">
                 <div className="text-slate-500 uppercase tracking-wide text-[10px]">{displayName(a)}</div>
-                <div className="text-slate-800 font-medium">{displayLevel(a, c.profile[ai])}</div>
+                <div className="text-slate-800 font-medium">{displayLevel(a, c.profile[ai], c.profile, ai)}</div>
               </div>
             ))}
           </div>
@@ -5204,8 +5489,12 @@ function StepData() {
 // ========================================================================
 
 function buildHBPayload(study) {
-  const attrs = study.attributes;
   const cfg = study.choiceConfig;
+  // Composites: estimate in collapsed space (bundled attrs are singular in original space).
+  const _cp = collapse(study.attributes, study.attributeLinks || []);
+  const _bundled = hasBundles(_cp.map);
+  const attrs = _bundled ? _cp.attributes : study.attributes;
+  const _prof = (p) => _bundled ? collapseProfile(p, _cp.map) : p;
   const layout = buildParamLayout(attrs, cfg.includeNone);
   const includeNone = cfg.includeNone;
   const pTotal = layout.nPar;
@@ -5236,7 +5525,7 @@ function buildHBPayload(study) {
       const chosenPos = resp.tasks[Number(k.split('|')[1])];
       const chosenIdx = chosenPos === 0 ? -1 : alts.findIndex(a => a.position === chosenPos);
       if (chosenIdx === -2 || (chosenPos !== 0 && chosenIdx < 0)) return; // skip
-      const rows = alts.map(a => profileToDummyRow(a.profile, attrs, layout));
+      const rows = alts.map(a => profileToDummyRow(_prof(a.profile), attrs, layout));
       taskAlts.push(rows);
       chosen.push(chosenIdx);
       altCounts.push(rows.length);
@@ -5269,10 +5558,38 @@ function buildHBPayload(study) {
 }
 
 // ----- Latent Class EM (main thread) -----
+// Convert a collapsed-space segment beta vector to original attribute param layout (spec 07 §5).
+function collapsedBetaToOriginal(beta, cMap, origAttrs, cAttrs, includeNone) {
+  const cLayout = buildParamLayout(cAttrs, includeNone);
+  const oLayout = buildParamLayout(origAttrs, includeNone);
+  const out = new Array(oLayout.nPar).fill(0);
+  cMap.meta.forEach((m, ci) => {
+    const cref = cLayout.attrRef[ci];
+    const cUtils = cAttrs[ci].levels.map((_, cl) => cl === cref ? 0 : beta[cLayout.offsets[ci] + (cl < cref ? cl : cl - 1)]);
+    if (m.kind === 'pass') {
+      const o = m.orig, oref = oLayout.attrRef[o];
+      origAttrs[o].levels.forEach((_, li) => { if (li !== oref) out[oLayout.offsets[o] + (li < oref ? li : li - 1)] = cUtils[li]; });
+    } else {
+      const La = origAttrs[m.attrA].levels.length, Lb = origAttrs[m.attrB].levels.length;
+      const dec = buildDecomposer(m.pairs, La, Lb).apply(cUtils);
+      const wa = oLayout.attrRef[m.attrA];
+      origAttrs[m.attrA].levels.forEach((_, li) => { if (li !== wa) out[oLayout.offsets[m.attrA] + (li < wa ? li : li - 1)] = dec.a[li]; });
+      const wb = oLayout.attrRef[m.attrB];
+      origAttrs[m.attrB].levels.forEach((_, li) => { if (li !== wb) out[oLayout.offsets[m.attrB] + (li < wb ? li : li - 1)] = dec.b[li]; });
+    }
+  });
+  if (includeNone) out[oLayout.nPar - 1] = beta[cLayout.nPar - 1];
+  return out;
+}
+
 function runLCA(study, K, opts) {
   opts = opts || {};
-  const attrs = study.attributes;
   const cfg = study.choiceConfig;
+  // Composites: estimate in collapsed space (bundled attrs singular otherwise).
+  const _cp = collapse(study.attributes, study.attributeLinks || []);
+  const _bundled = hasBundles(_cp.map);
+  const attrs = _bundled ? _cp.attributes : study.attributes;
+  const _prof = (p) => _bundled ? collapseProfile(p, _cp.map) : p;
   const layout = buildParamLayout(attrs, cfg.includeNone);
   const nPar = layout.nPar;
   const respondents = study.responses.rows.filter(r => !r.exclude);
@@ -5295,7 +5612,7 @@ function runLCA(study, K, opts) {
       const chosenPos = resp.tasks[Number(tn)];
       const chosenIdx = chosenPos === 0 ? -1 : alts.findIndex(a => a.position === chosenPos);
       if (chosenPos !== 0 && chosenIdx < 0) return;
-      const rows = alts.map(a => profileToDummyRow(a.profile, attrs, layout));
+      const rows = alts.map(a => profileToDummyRow(_prof(a.profile), attrs, layout));
       tasks.push({ rows, chosen: chosenIdx });
     });
     return tasks;
@@ -5441,6 +5758,8 @@ function runLCA(study, K, opts) {
   best.bic = -2 * best.ll + nParTotal * Math.log(N);
   best.aic = -2 * best.ll + 2 * nParTotal;
   best.sizes = best.pi.map(p => Math.round(p * 100));
+  // Composites: convert collapsed segment betas to original space for display/narratives.
+  if (_bundled) best.betas = best.betas.map(b => collapsedBetaToOriginal(b, _cp.map, study.attributes, attrs, cfg.includeNone));
   return best;
 }
 
@@ -5450,38 +5769,59 @@ function buildHBWorker() {
   return new Worker(URL.createObjectURL(blob));
 }
 
-function utilityStructure(study, betaFlat, pTotal) {
-  // Returns: perRespondent utility per level, including reference=0, for each attribute.
-  const attrs = study.attributes;
-  const layout = buildParamLayout(attrs, study.choiceConfig.includeNone);
-  const R = Math.floor(betaFlat.length / pTotal);
-  const perResp = []; // [R][attr][level] = utility
-  for (let r = 0; r < R; r++) {
-    const utils = attrs.map((a, ai) => {
-      const ref = layout.attrRef[ai];
-      const out = a.levels.map((_, li) => {
-        if (li === ref) return 0;
-        const paramIdx = layout.offsets[ai] + (li < ref ? li : li - 1);
-        return betaFlat[r * pTotal + paramIdx];
-      });
-      return out;
-    });
-    perResp.push(utils);
-  }
-  const noneUtils = study.choiceConfig.includeNone
-    ? range(R).map(r => betaFlat[r * pTotal + pTotal - 1])
-    : null;
-  // Aggregate means
+function _summarizeUtils(perResp, attrs) {
   const meanPerLevel = attrs.map((a, ai) => a.levels.map((_, li) => mean(perResp.map(u => u[ai][li]))));
   const sdPerLevel = attrs.map((a, ai) => a.levels.map((_, li) => stdev(perResp.map(u => u[ai][li]))));
-  // Importance per respondent then aggregate
   const importance = attrs.map(() => 0);
   perResp.forEach(utils => {
     const ranges = utils.map(u => Math.max(...u) - Math.min(...u));
     const tot = sum(ranges) || 1;
     ranges.forEach((r, ai) => { importance[ai] += (r / tot) / perResp.length; });
   });
-  return { perResp, noneUtils, meanPerLevel, sdPerLevel, importance };
+  return { meanPerLevel, sdPerLevel, importance };
+}
+
+function utilityStructure(study, betaFlat, pTotal) {
+  // Composite-aware (spec 07 §5): estimation ran in collapsed space; decompose back.
+  const _cp = collapse(study.attributes, study.attributeLinks || []);
+  const useAttrs = hasBundles(_cp.map) ? _cp.attributes : study.attributes;
+  const layout = buildParamLayout(useAttrs, study.choiceConfig.includeNone);
+  const R = Math.floor(betaFlat.length / pTotal);
+  const cPerResp = []; // [R][collapsedAttr][level]
+  for (let r = 0; r < R; r++) {
+    cPerResp.push(useAttrs.map((a, ai) => {
+      const ref = layout.attrRef[ai];
+      return a.levels.map((_, li) => {
+        if (li === ref) return 0;
+        const paramIdx = layout.offsets[ai] + (li < ref ? li : li - 1);
+        return betaFlat[r * pTotal + paramIdx];
+      });
+    }));
+  }
+  const noneUtils = study.choiceConfig.includeNone
+    ? range(R).map(r => betaFlat[r * pTotal + pTotal - 1])
+    : null;
+
+  if (!hasBundles(_cp.map)) {
+    const s = _summarizeUtils(cPerResp, useAttrs);
+    return { perResp: cPerResp, noneUtils, meanPerLevel: s.meanPerLevel, sdPerLevel: s.sdPerLevel, importance: s.importance };
+  }
+
+  // Decompose composite per-resp utilities back into original attribute space.
+  const origAttrs = study.attributes;
+  const decomposers = _cp.map.meta.map(m => m.kind === 'composite'
+    ? buildDecomposer(m.pairs, origAttrs[m.attrA].levels.length, origAttrs[m.attrB].levels.length) : null);
+  const perResp = [];
+  for (let r = 0; r < R; r++) {
+    const orig = origAttrs.map(a => a.levels.map(() => 0));
+    _cp.map.meta.forEach((m, ci) => {
+      if (m.kind === 'pass') orig[m.orig] = cPerResp[r][ci].slice();
+      else { const d = decomposers[ci].apply(cPerResp[r][ci]); orig[m.attrA] = d.a; orig[m.attrB] = d.b; }
+    });
+    perResp.push(orig);
+  }
+  const s = _summarizeUtils(perResp, origAttrs);
+  return { perResp, noneUtils, meanPerLevel: s.meanPerLevel, sdPerLevel: s.sdPerLevel, importance: s.importance };
 }
 
 function StepAnalysis() {
